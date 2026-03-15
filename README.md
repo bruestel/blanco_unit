@@ -513,6 +513,55 @@ automation:
 3. Check parameter values are within valid ranges
 4. Review Home Assistant logs for specific error messages
 
+## Standalone MQTT Bridge
+
+A standalone Python script `blanco_mqtt.py` is provided for environments where Home Assistant is not directly used or as a gateway on a separate device (e.g., Raspberry Pi).
+
+### Requirements
+
+- **Python**: 3.13 or newer
+- **uv**: Recommended for dependency management
+- **Dependencies**: 
+  - `bleak`
+  - `paho-mqtt`
+  - `python-dotenv`
+
+### Setup
+
+1. **Clone the repository** to your gateway device.
+2. **Install dependencies** (using `uv`):
+   ```bash
+   uv pip install bleak paho-mqtt python-dotenv
+   ```
+3. **Configure the environment** by creating a `.env` file:
+   ```env
+   # MQTT Configuration
+   MQTT_BROKER=10.168.139.10
+   MQTT_PORT=1883
+   MQTT_USER=your_user          # Optional
+   MQTT_PASSWORD=your_password  # Optional
+
+   # Blanco Unit Configuration
+   BLANCO_MAC=34:5F:45:E8:E7:76
+   BLANCO_PIN=12345
+
+   # Polling interval (seconds)
+   POLL_INTERVAL=900
+   ```
+4. **Run the bridge**:
+   ```bash
+   python3 blanco_mqtt.py
+   ```
+
+### MQTT Topics
+
+- `blanco/<mac_id>/status`: Current device status and info (JSON)
+- `blanco/<mac_id>/available`: Availability status (`online`/`offline`)
+- `blanco/<mac_id>/command/dispense`: Command to dispense water
+  - Payload: `{"amount": 250, "intensity": 2}`
+- `blanco/<mac_id>/command/refresh`: Trigger an immediate status update
+- `blanco/<mac_id>/command/result`: Result of the last command (`success`/`failed`)
+
 ## Technical Details
 
 For developers and advanced users interested in the Bluetooth protocol implementation, message formats, and authentication mechanism, see [BLUETOOTH_PROTOCOL.md](BLUETOOTH_PROTOCOL.md).
