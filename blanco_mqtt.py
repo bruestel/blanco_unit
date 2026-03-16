@@ -78,6 +78,7 @@ class BlancoMQTTBridge:
         self.loop = None
         self.device_info = {}
         self._is_fast_polling = False
+        self._conn_lock = asyncio.Lock()
         
         # Generate unique client ID for the session
         client_id = f"blanco_bridge_{MAC_ID}"
@@ -126,10 +127,45 @@ class BlancoMQTTBridge:
         except Exception as e:
             _LOGGER.error("Failed to parse MQTT message: %s", e)
 
+    async def ensure_connected(self, force_rescan: bool = False) -> bool:
+        """Ensure we have a valid client and device, scanning if needed."""
+        if not force_rescan and self.blanco_client and self.blanco_client.is_connected:
+            return True
+
+        async with self._conn_lock:
+            # Re-check inside lock
+            if not force_rescan and self.blanco_client and self.blanco_client.is_connected:
+                return True
+
+            _LOGGER.info("Ensuring connection to Blanco Unit (Force Rescan=%s)...", force_rescan)
+            
+            try:
+                if force_rescan or not self.device:
+                    _LOGGER.info("Scanning for Blanco Unit %s...", BLANCO_MAC)
+                    self.device = await BleakScanner.find_device_by_address(BLANCO_MAC, timeout=20.0)
+                    
+                    if not self.device:
+                        _LOGGER.error("Blanco Unit not found during scan!")
+                        return False
+                    
+                    _LOGGER.info("Device found. Re-initializing client...")
+                    self.blanco_client = BlancoUnitBluetoothClient(
+                        pin=BLANCO_PIN,
+                        device=self.device,
+                        connection_callback=lambda connected: _LOGGER.info(
+                            "Bluetooth Status: %s", "CONNECTED" if connected else "DISCONNECTED"
+                        )
+                    )
+                
+                return True
+            except Exception as e:
+                _LOGGER.error("Error during connection setup: %s", e)
+                return False
+
     async def dispense(self, amount: int, intensity: int) -> None:
         """Execute water dispensing and trigger fast polling."""
-        if not self.blanco_client:
-            _LOGGER.warning("Blanco client not initialized")
+        if not await self.ensure_connected():
+            _LOGGER.warning("Could not ensure connection for dispensing")
             return
             
         try:
@@ -143,10 +179,13 @@ class BlancoMQTTBridge:
         except Exception as e:
             _LOGGER.error("Error during dispensing: %s", e)
             self.mqtt_client.publish(TOPIC_CMD_RESULT, f"error: {e}")
+            # If we get a connection error, force a rescan next time
+            if "not connected" in str(e).lower() or "0x0e" in str(e):
+                await self.ensure_connected(force_rescan=True)
 
     async def fetch_device_info(self) -> None:
         """Fetch static device information."""
-        if not self.blanco_client:
+        if not await self.ensure_connected():
             return
 
         try:
@@ -177,12 +216,14 @@ class BlancoMQTTBridge:
 
     async def update_status(self, retries: int = 2) -> None:
         """Perform a single status update and publish to MQTT with retries."""
-        if not self.blanco_client:
-            _LOGGER.warning("Blanco client not initialized for status update")
-            return
-
         for attempt in range(retries + 1):
             try:
+                # Force rescan if this is a retry
+                if not await self.ensure_connected(force_rescan=(attempt > 0)):
+                    _LOGGER.warning("Status update attempt %d: connection failed", attempt + 1)
+                    await asyncio.sleep(2)
+                    continue
+
                 self.mqtt_client.publish(TOPIC_AVAILABLE, "online", retain=True)
                 _LOGGER.info("Updating Blanco Unit status (Attempt %d/%d)...", attempt + 1, retries + 1)
                 
@@ -211,10 +252,9 @@ class BlancoMQTTBridge:
             except Exception as e:
                 _LOGGER.warning("Status update attempt %d failed: %s", attempt + 1, e)
                 if attempt < retries:
-                    # Wait a bit before retrying, force disconnect to fresh session
-                    await asyncio.sleep(2)
-                    if "0x0e" in str(e) or "Disconnected" in str(e) or "not found" in str(e).lower():
-                         _LOGGER.info("Transient error detected, forcing disconnect before retry...")
+                    await asyncio.sleep(5)
+                    if "0x0e" in str(e) or "Disconnected" in str(e) or "not connected" in str(e).lower():
+                         _LOGGER.info("Connection error detected, forcing disconnect before retry...")
                          try:
                              await self.blanco_client.disconnect()
                          except:
@@ -233,16 +273,15 @@ class BlancoMQTTBridge:
         
         try:
             while time.time() < end_time:
-                await self.update_status()
+                await self.update_status(retries=0)
                 await asyncio.sleep(interval)
         finally:
             self._is_fast_polling = False
             _LOGGER.info("Fast status polling finished.")
 
     async def poll_status(self) -> None:
-        """Periodic status update via persistent connection."""
+        """Periodic status update via periodic connection."""
         while True:
-            # Skip regular poll if fast polling is active to avoid conflicts
             if not self._is_fast_polling:
                 await self.update_status()
             await asyncio.sleep(POLL_INTERVAL)
@@ -251,31 +290,11 @@ class BlancoMQTTBridge:
         """Start the bridge and run the main loop."""
         self.loop = asyncio.get_running_loop()
         
-        # 1. Scan for device
-        _LOGGER.info("Scanning for Blanco Unit %s...", BLANCO_MAC)
-        try:
-            self.device = await BleakScanner.find_device_by_address(BLANCO_MAC)
-        except Exception as e:
-            _LOGGER.error("Bluetooth scan failed: %s", e)
-            return
-        
-        if not self.device:
-            _LOGGER.error("Blanco Unit not found!")
-            return
+        if await self.ensure_connected():
+            await self.fetch_device_info()
+        else:
+            _LOGGER.warning("Initial connection failed, will retry during polling")
 
-        # 2. Initialize Blanco Client
-        self.blanco_client = BlancoUnitBluetoothClient(
-            pin=BLANCO_PIN,
-            device=self.device,
-            connection_callback=lambda connected: _LOGGER.info(
-                "Bluetooth Status: %s", "CONNECTED" if connected else "DISCONNECTED"
-            )
-        )
-
-        # 3. Fetch device info once
-        await self.fetch_device_info()
-
-        # 4. Connect to MQTT
         _LOGGER.info("Connecting to MQTT Broker at %s:%d...", MQTT_BROKER, MQTT_PORT)
         try:
             self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT)
@@ -284,17 +303,23 @@ class BlancoMQTTBridge:
             _LOGGER.error("MQTT Connection failed: %s", e)
             return
 
-        # 5. Start status polling
         await self.poll_status()
 
     async def stop(self) -> None:
         """Gracefully stop the bridge and disconnect clients."""
         _LOGGER.info("Shutting down bridge...")
-        self.mqtt_client.publish(TOPIC_AVAILABLE, "offline", retain=True)
-        self.mqtt_client.loop_stop()
-        self.mqtt_client.disconnect()
+        try:
+            self.mqtt_client.publish(TOPIC_AVAILABLE, "offline", retain=True)
+            self.mqtt_client.loop_stop()
+            self.mqtt_client.disconnect()
+        except:
+            pass
+            
         if self.blanco_client:
-            await self.blanco_client.disconnect()
+            try:
+                await self.blanco_client.disconnect()
+            except:
+                pass
 
 if __name__ == "__main__":
     bridge = BlancoMQTTBridge()
